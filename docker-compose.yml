@@ -1,0 +1,13 @@
+services:
+  bot:
+    build: .
+    image: tg-training-bot
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      TZ: ${TZ:-Europe/Moscow}
+    volumes:
+      - bot-data:/app/data
+
+volumes:
+  bot-data:
