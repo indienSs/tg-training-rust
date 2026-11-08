@@ -24,6 +24,11 @@ pub fn spawn(bot: Bot, db: Arc<Database>) -> tokio::task::JoinHandle<()> {
 }
 
 async fn tick(bot: &Bot, db: &Database) -> Result<(), Box<dyn StdError + Send + Sync>> {
+    match db.complete_past_bookings() {
+        Ok(n) if n > 0 => log::info!("completed {n} past booking(s)"),
+        Ok(_) => {}
+        Err(e) => log::error!("failed to complete past bookings: {e}"),
+    }
     for b in db.bookings_to_remind()? {
         send_reminder(bot, db, &b).await;
     }

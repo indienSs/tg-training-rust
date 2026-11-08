@@ -40,12 +40,22 @@ const CLIENT_HELP: &str = "Этот бот помогает записывать
     За 2 часа до тренировки я пришлю напоминание и уточню, придете ли вы.";
 
 const TRAINER_HELP: &str = "Вы вошли как тренер. Команды:\n\n\
-    /addslot 2026-11-08 10:00 — добавить слот\n\
-    /addday 2026-11-08 09:00 18:00 60 — слоты на день (с—по, шаг в минутах)\n\
+    Рабочий график:\n\
+    /setworkday 08:00 20:00 60 — стандартный ежедневный график (с, до, шаг в минутах)\n\
+    /addworkday — слоты на сегодня по графику\n\
+    /addworkdays 7 — слоты на 7 дней, начиная с сегодня\n\
+    /delworkday 2026-11-08 — удалить слоты за дату\n\
+    /delworkdays 7 — удалить слоты за 7 дней с сегодня\n\n\
+    Точечно:\n\
+    /addslot 2026-11-08 10:00 — добавить один слот\n\
+    /addday 2026-11-08 09:00 18:00 60 — слоты на день (с—по, шаг)\n\
     /slots — будущие слоты (id и занятость)\n\
-    /delslot <id> — удалить слот\n\
-    /bookings — активные записи клиентов\n\
-    /users — список клиентов\n\
+    /delslot <id> — удалить слот\n\n\
+    Клиенты:\n\
+    /bookings — активные записи\n\
+    /users — список клиентов (id для /ban)\n\
+    /ban <id или @username> — заблокировать клиента\n\
+    /unban <id или @username> — разблокировать клиента\n\
     /broadcast <текст> — рассылка всем клиентам\n\n\
     О каждой записи, подтверждении и отмене я буду присылать уведомления.";
 
@@ -64,6 +74,16 @@ pub enum Command {
     AddSlot,
     #[command(description = "тренер: слоты на день, напр. /addday 2026-11-08 09:00 18:00 60")]
     AddDay,
+    #[command(description = "тренер: стандартный график, напр. /setworkday 08:00 20:00 60")]
+    SetWorkDay,
+    #[command(description = "тренер: слоты на сегодня по стандартному графику")]
+    AddWorkDay,
+    #[command(description = "тренер: слоты на N дней с сегодня, напр. /addworkdays 7")]
+    AddWorkDays,
+    #[command(description = "тренер: удалить слоты за дату, напр. /delworkday 2026-11-08")]
+    DelWorkDay,
+    #[command(description = "тренер: удалить слоты за N дней с сегодня")]
+    DelWorkDays,
     #[command(description = "тренер: удалить слот по id")]
     DelSlot,
     #[command(description = "тренер: список слотов")]
@@ -72,6 +92,10 @@ pub enum Command {
     Bookings,
     #[command(description = "тренер: список клиентов")]
     Users,
+    #[command(description = "тренер: заблокировать: /ban id_или_@username")]
+    Ban,
+    #[command(description = "тренер: разблокировать: /unban id_или_@username")]
+    Unban,
     #[command(description = "тренер: рассылка, напр. /broadcast текст")]
     Broadcast,
 }
@@ -155,12 +179,81 @@ fn local_to_utc(d: NaiveDate, t: NaiveTime) -> Option<DateTime<Utc>> {
         .map(|dt| dt.with_timezone(&Utc))
 }
 
+fn today_local() -> NaiveDate {
+    Local::now().date_naive()
+}
+
+fn minutes_to_time(m: i64) -> Option<NaiveTime> {
+    NaiveTime::from_hms_opt((m / 60) as u32, (m % 60) as u32, 0)
+}
+
+fn time_to_minutes(t: NaiveTime) -> i64 {
+    (t.num_seconds_from_midnight() / 60) as i64
+}
+
+fn fmt_minutes(m: i64) -> String {
+    format!("{:02}:{:02}", m / 60, m % 60)
+}
+
+fn gen_work_slots(dates: &[NaiveDate], from_m: i64, to_m: i64, step: i64) -> Vec<DateTime<Utc>> {
+    let mut out = Vec::new();
+    for &d in dates {
+        let mut m = from_m;
+        while m + step <= to_m {
+            if let Some(t) = minutes_to_time(m)
+                && let Some(dt) = local_to_utc(d, t)
+            {
+                out.push(dt);
+            }
+            m += step;
+        }
+    }
+    out
+}
+
+fn day_bounds_utc(d: NaiveDate) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+    let lo_naive = d.and_hms_opt(0, 0, 0)?;
+    let hi_naive = d.succ_opt()?.and_hms_opt(0, 0, 0)?;
+    let lo = Local.from_local_datetime(&lo_naive).single()?;
+    let hi = Local.from_local_datetime(&hi_naive).single()?;
+    Some((lo.with_timezone(&Utc), hi.with_timezone(&Utc)))
+}
+
+async fn add_slots_and_report(
+    bot: &Bot,
+    chat_id: ChatId,
+    db: &Database,
+    dts: Vec<DateTime<Utc>>,
+    label: &str,
+) -> HResult {
+    let now = Utc::now();
+    let past = dts.iter().filter(|dt| **dt <= now).count();
+    let future: Vec<(DateTime<Utc>, i64)> = dts
+        .into_iter()
+        .filter(|dt| *dt > now)
+        .map(|dt| (dt, 60))
+        .collect();
+    let total = future.len();
+    let created = db.insert_slots_batch(&future)?;
+    let mut text =
+        format!("✅ Добавлено новых слотов: {created} (промежутков: {total}) — {label}.");
+    if past > 0 {
+        text.push_str(&format!("\n⏳ Пропущено прошедших: {past}."));
+    }
+    bot.send_message(chat_id, text).await?;
+    Ok(())
+}
+
 fn user_desc(db: &Database, chat_id: i64) -> String {
     match db.get_user(chat_id) {
-        Ok(Some(u)) => match u.username {
-            Some(un) => format!("{} (@{})", u.full_name, un),
-            None => u.full_name,
-        },
+        Ok(Some(u)) => {
+            let un = u
+                .username
+                .as_deref()
+                .map(|x| format!(" (@{x})"))
+                .unwrap_or_default();
+            format!("{}{un} · id {}", u.full_name, u.chat_id)
+        }
         _ => format!("id {chat_id}"),
     }
 }
@@ -302,7 +395,7 @@ async fn trainer_slots_view(bot: &Bot, chat_id: ChatId, db: &Database) -> HResul
     if views.is_empty() {
         bot.send_message(
             chat_id,
-            "Будущих слотов нет.\nДобавьте: /addslot 2026-11-08 10:00\nИли на весь день: /addday 2026-11-08 09:00 18:00 60",
+            "Будущих слотов нет.\nДобавьте по стандартному графику: /addworkday (сегодня) или /addworkdays 7\nИли точечно: /addslot 2026-11-08 10:00, /addday 2026-11-08 09:00 18:00 60\nГрафик задаётся командой /setworkday 08:00 20:00 60",
         )
         .await?;
         return Ok(());
@@ -371,14 +464,13 @@ async fn trainer_users_view(bot: &Bot, chat_id: ChatId, db: &Database, cfg: &Con
     }
     let mut text = format!("👥 Клиентов: {}\n\n", users.len());
     for u in &users {
-        text.push_str(&format!(
-            "• {}{}\n",
-            u.full_name,
-            u.username
-                .as_deref()
-                .map(|un| format!(" (@{un})"))
-                .unwrap_or_default()
-        ));
+        let un = u
+            .username
+            .as_deref()
+            .map(|x| format!(" (@{x})"))
+            .unwrap_or_default();
+        let mark = if u.banned { " [⛔]" } else { "" };
+        text.push_str(&format!("• {}{un} · id {}{mark}\n", u.full_name, u.chat_id));
     }
     bot.send_message(chat_id, text).await?;
     Ok(())
@@ -405,7 +497,7 @@ async fn broadcast(
     let users: Vec<_> = db
         .all_users()?
         .into_iter()
-        .filter(|u| u.chat_id != cfg.trainer_chat_id && u.chat_id != chat_id.0)
+        .filter(|u| !u.banned && u.chat_id != cfg.trainer_chat_id && u.chat_id != chat_id.0)
         .collect();
     let mut sent = 0usize;
     let mut failed = 0usize;
@@ -436,6 +528,11 @@ pub async fn handle_command(
 ) -> HResult {
     let chat_id = msg.chat.id;
     let is_trainer = chat_id.0 == cfg.trainer_chat_id;
+    if !is_trainer && db.is_banned(chat_id.0)? {
+        bot.send_message(chat_id, "⛔ Доступ к боту закрыт.")
+            .await?;
+        return Ok(());
+    }
     if let Some(u) = msg.from.as_ref() {
         db.upsert_user(u.id.0 as i64, u.username.as_deref(), &u.full_name())?;
     }
@@ -548,41 +645,206 @@ pub async fn handle_command(
                     .await?;
                 return Ok(());
             }
-            let from_m = (from.num_seconds_from_midnight() / 60) as i64;
-            let to_m = (to.num_seconds_from_midnight() / 60) as i64;
+            let from_m = time_to_minutes(from);
+            let to_m = time_to_minutes(to);
             if to_m <= from_m {
                 bot.send_message(chat_id, "Время «до» должно быть позже времени «с».")
                     .await?;
                 return Ok(());
             }
-            let now = Utc::now();
-            let mut created = 0usize;
-            let mut total = 0usize;
-            let mut m = from_m;
-            while m + step <= to_m {
-                let Some(t) = NaiveTime::from_hms_opt((m / 60) as u32, (m % 60) as u32, 0) else {
-                    m += step;
-                    continue;
-                };
-                if let Some(dt) = local_to_utc(d, t)
-                    && dt > now
-                {
-                    total += 1;
-                    if db.insert_slot(dt, 60)? {
-                        created += 1;
-                    }
-                }
-                m += step;
+            let dts = gen_work_slots(&[d], from_m, to_m, step);
+            add_slots_and_report(
+                &bot,
+                chat_id,
+                &db,
+                dts,
+                &fmt_date_key(&d.format("%Y-%m-%d").to_string()),
+            )
+            .await?;
+        }
+        Command::SetWorkDay => {
+            if let Some(res) = guard(is_trainer).await {
+                return res;
             }
-            if total == 0 {
-                bot.send_message(chat_id, "Все слоты этого дня уже в прошлом.")
+            let args: Vec<&str> = msg
+                .text()
+                .map(|t| t.split_whitespace().collect())
+                .unwrap_or_default();
+            if args.len() != 4 {
+                bot.send_message(chat_id, "Использование: /setworkday 08:00 20:00 60")
                     .await?;
-            } else {
+                return Ok(());
+            }
+            let (Some(from), Some(to)) = (parse_time(args[1]), parse_time(args[2])) else {
                 bot.send_message(
                     chat_id,
-                    format!("✅ Добавлено новых слотов: {created} (промежутков: {total})."),
+                    "Не понял время. Пример: /setworkday 08:00 20:00 60",
                 )
                 .await?;
+                return Ok(());
+            };
+            let Ok(step) = args[3].parse::<i64>() else {
+                bot.send_message(chat_id, "Шаг должен быть числом минут, например 60.")
+                    .await?;
+                return Ok(());
+            };
+            if !(15..=240).contains(&step) {
+                bot.send_message(chat_id, "Шаг должен быть от 15 до 240 минут.")
+                    .await?;
+                return Ok(());
+            }
+            let from_m = time_to_minutes(from);
+            let to_m = time_to_minutes(to);
+            if to_m <= from_m {
+                bot.send_message(chat_id, "Время «до» должно быть позже времени «с».")
+                    .await?;
+                return Ok(());
+            }
+            db.set_workday(from_m, to_m, step)?;
+            bot.send_message(
+                chat_id,
+                format!(
+                    "✅ Стандартный график сохранён: {}–{}, шаг {step} мин.\nДобавляйте слоты: /addworkday (сегодня) или /addworkdays N (N дней).",
+                    fmt_minutes(from_m),
+                    fmt_minutes(to_m)
+                ),
+            )
+            .await?;
+        }
+        Command::AddWorkDay => {
+            if let Some(res) = guard(is_trainer).await {
+                return res;
+            }
+            let Some((from_m, to_m, step)) = db.get_workday()? else {
+                bot.send_message(
+                    chat_id,
+                    "Сначала задайте стандартный график: /setworkday 08:00 20:00 60",
+                )
+                .await?;
+                return Ok(());
+            };
+            let today = today_local();
+            let dts = gen_work_slots(&[today], from_m, to_m, step);
+            add_slots_and_report(&bot, chat_id, &db, dts, "сегодня").await?;
+        }
+        Command::AddWorkDays => {
+            if let Some(res) = guard(is_trainer).await {
+                return res;
+            }
+            let args: Vec<&str> = msg
+                .text()
+                .map(|t| t.split_whitespace().collect())
+                .unwrap_or_default();
+            let Some(days) = args.get(1).and_then(|s| s.parse::<u32>().ok()) else {
+                bot.send_message(chat_id, "Использование: /addworkdays 7 (от 1 до 90 дней)")
+                    .await?;
+                return Ok(());
+            };
+            if !(1..=90).contains(&days) {
+                bot.send_message(chat_id, "Количество дней — от 1 до 90.")
+                    .await?;
+                return Ok(());
+            }
+            let Some((from_m, to_m, step)) = db.get_workday()? else {
+                bot.send_message(
+                    chat_id,
+                    "Сначала задайте стандартный график: /setworkday 08:00 20:00 60",
+                )
+                .await?;
+                return Ok(());
+            };
+            let today = today_local();
+            let dates: Vec<NaiveDate> = (0..days)
+                .filter_map(|i| today.checked_add_signed(chrono::Duration::days(i as i64)))
+                .collect();
+            let dts = gen_work_slots(&dates, from_m, to_m, step);
+            add_slots_and_report(
+                &bot,
+                chat_id,
+                &db,
+                dts,
+                &format!("{} дн., начиная с сегодня", dates.len()),
+            )
+            .await?;
+        }
+        Command::DelWorkDay => {
+            if let Some(res) = guard(is_trainer).await {
+                return res;
+            }
+            let args: Vec<&str> = msg
+                .text()
+                .map(|t| t.split_whitespace().collect())
+                .unwrap_or_default();
+            if args.len() != 2 {
+                bot.send_message(chat_id, "Использование: /delworkday 2026-11-08")
+                    .await?;
+                return Ok(());
+            }
+            let Some(d) = parse_date(args[1]) else {
+                bot.send_message(chat_id, "Не понял дату. Пример: /delworkday 2026-11-08")
+                    .await?;
+                return Ok(());
+            };
+            let Some((lo, hi)) = day_bounds_utc(d) else {
+                bot.send_message(chat_id, "Не удалось обработать эту дату.")
+                    .await?;
+                return Ok(());
+            };
+            let (deleted, booked) = db.delete_free_slots_range(lo, hi)?;
+            bot.send_message(
+                chat_id,
+                format!("🗑 Удалено слотов за {}: {deleted}.", fmt_date_key(args[1])),
+            )
+            .await?;
+            if booked > 0 {
+                bot.send_message(chat_id, format!("⚠️ Пропущено занятых слотов: {booked}."))
+                    .await?;
+            }
+        }
+        Command::DelWorkDays => {
+            if let Some(res) = guard(is_trainer).await {
+                return res;
+            }
+            let args: Vec<&str> = msg
+                .text()
+                .map(|t| t.split_whitespace().collect())
+                .unwrap_or_default();
+            let Some(days) = args.get(1).and_then(|s| s.parse::<u32>().ok()) else {
+                bot.send_message(chat_id, "Использование: /delworkdays 7 (от 1 до 90 дней)")
+                    .await?;
+                return Ok(());
+            };
+            if !(1..=90).contains(&days) {
+                bot.send_message(chat_id, "Количество дней — от 1 до 90.")
+                    .await?;
+                return Ok(());
+            }
+            let today = today_local();
+            let Some(end_date) = today.checked_add_signed(chrono::Duration::days(days as i64))
+            else {
+                bot.send_message(chat_id, "Не удалось обработать диапазон.")
+                    .await?;
+                return Ok(());
+            };
+            let Some((lo, _)) = day_bounds_utc(today) else {
+                bot.send_message(chat_id, "Не удалось обработать дату.")
+                    .await?;
+                return Ok(());
+            };
+            let Some((hi, _)) = day_bounds_utc(end_date) else {
+                bot.send_message(chat_id, "Не удалось обработать дату.")
+                    .await?;
+                return Ok(());
+            };
+            let (deleted, booked) = db.delete_free_slots_range(lo, hi)?;
+            bot.send_message(
+                chat_id,
+                format!("🗑 Удалено слотов на {days} дн. с сегодня: {deleted}."),
+            )
+            .await?;
+            if booked > 0 {
+                bot.send_message(chat_id, format!("⚠️ Пропущено занятых слотов: {booked}."))
+                    .await?;
             }
         }
         Command::DelSlot => {
@@ -633,6 +895,58 @@ pub async fn handle_command(
             }
             trainer_users_view(&bot, chat_id, &db, &cfg).await?;
         }
+        Command::Ban | Command::Unban => {
+            if let Some(res) = guard(is_trainer).await {
+                return res;
+            }
+            let ban = matches!(cmd, Command::Ban);
+            let args: Vec<&str> = msg
+                .text()
+                .map(|t| t.split_whitespace().collect())
+                .unwrap_or_default();
+            if args.len() != 2 {
+                bot.send_message(
+                    chat_id,
+                    "Использование: /ban <id или @username> (id — в /users)",
+                )
+                .await?;
+                return Ok(());
+            }
+            let target = args[1];
+            let target_id = if let Ok(id) = target.parse::<i64>() {
+                Some(id)
+            } else {
+                target
+                    .strip_prefix('@')
+                    .and_then(|un| db.get_user_by_username(un).ok().flatten())
+                    .map(|u| u.chat_id)
+            };
+            let Some(target_id) = target_id else {
+                bot.send_message(
+                    chat_id,
+                    "Не нашёл пользователя. Укажите id или @username (см. /users).",
+                )
+                .await?;
+                return Ok(());
+            };
+            if target_id == cfg.trainer_chat_id {
+                bot.send_message(chat_id, "Тренера забанить нельзя 😄")
+                    .await?;
+                return Ok(());
+            }
+            if !db.set_banned(target_id, ban)? {
+                bot.send_message(chat_id, "Пользователь не найден — он ещё не писал боту.")
+                    .await?;
+                return Ok(());
+            }
+            let action = if ban {
+                "⛔ Заблокирован"
+            } else {
+                "✅ Разблокирован"
+            };
+            bot.send_message(chat_id, format!("{action}: {}", user_desc(&db, target_id)))
+                .await?;
+        }
         Command::Broadcast => {
             if let Some(res) = guard(is_trainer).await {
                 return res;
@@ -646,6 +960,11 @@ pub async fn handle_command(
 pub async fn handle_text(bot: Bot, msg: Message, db: Arc<Database>, cfg: Arc<Config>) -> HResult {
     let chat_id = msg.chat.id;
     let is_trainer = chat_id.0 == cfg.trainer_chat_id;
+    if !is_trainer && db.is_banned(chat_id.0)? {
+        bot.send_message(chat_id, "⛔ Доступ к боту закрыт.")
+            .await?;
+        return Ok(());
+    }
     if let Some(u) = msg.from.as_ref() {
         db.upsert_user(u.id.0 as i64, u.username.as_deref(), &u.full_name())?;
     }
@@ -682,6 +1001,13 @@ pub async fn handle_callback(
         return Ok(());
     };
     let user_id = q.from.id.0 as i64;
+    if user_id != cfg.trainer_chat_id && db.is_banned(user_id)? {
+        bot.answer_callback_query(q.id.clone())
+            .text("⛔ Доступ к боту закрыт.")
+            .show_alert(true)
+            .await?;
+        return Ok(());
+    }
     let Some(target) = q.message.as_ref().map(|m| (m.chat().id, m.id())) else {
         bot.answer_callback_query(q.id.clone()).await?;
         return Ok(());
@@ -732,7 +1058,7 @@ pub async fn handle_callback(
                         chat_id,
                         msg_id,
                         &format!(
-                            "✅ Вы запислены: {range}.\nЗа 2 часа до тренировки пришлю напоминание."
+                            "✅ Вы записаны: {range}.\nЗа 2 часа до тренировки пришлю напоминание."
                         ),
                         empty_kb(),
                     )

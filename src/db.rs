@@ -12,6 +12,7 @@ pub struct UserRow {
     pub chat_id: i64,
     pub username: Option<String>,
     pub full_name: String,
+    pub banned: bool,
 }
 
 pub struct Slot {
@@ -47,6 +48,7 @@ CREATE TABLE IF NOT EXISTS users (
     chat_id    INTEGER PRIMARY KEY,
     username   TEXT,
     full_name  TEXT NOT NULL,
+    banned     INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS slots (
@@ -61,6 +63,12 @@ CREATE TABLE IF NOT EXISTS bookings (
     status       TEXT NOT NULL DEFAULT 'booked',
     reminded_at  TEXT,
     created_at   TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS workday (
+    id       INTEGER PRIMARY KEY CHECK (id = 1),
+    from_min INTEGER NOT NULL,
+    to_min   INTEGER NOT NULL,
+    step_min INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_bookings_slot ON bookings(slot_id);
 CREATE INDEX IF NOT EXISTS idx_slots_starts ON slots(starts_at);
@@ -87,6 +95,17 @@ impl Database {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", true)?;
         conn.execute_batch(DDL)?;
+        let has_banned: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('users') WHERE name = 'banned'",
+            [],
+            |r| r.get(0),
+        )?;
+        if has_banned == 0 {
+            conn.execute(
+                "ALTER TABLE users ADD COLUMN banned INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -112,30 +131,87 @@ impl Database {
             .lock()
             .expect("db mutex poisoned")
             .query_row(
-                "SELECT chat_id, username, full_name FROM users WHERE chat_id = ?1",
+                "SELECT chat_id, username, full_name, banned FROM users WHERE chat_id = ?1",
                 [chat_id],
                 |r| {
                     Ok(UserRow {
                         chat_id: r.get(0)?,
                         username: r.get(1)?,
                         full_name: r.get(2)?,
+                        banned: r.get::<_, i64>(3)? != 0,
                     })
                 },
             )
             .optional()
     }
 
+    pub fn get_user_by_username(&self, username: &str) -> rusqlite::Result<Option<UserRow>> {
+        self.conn
+            .lock()
+            .expect("db mutex poisoned")
+            .query_row(
+                "SELECT chat_id, username, full_name, banned
+                 FROM users WHERE username = ?1 COLLATE NOCASE",
+                [username],
+                |r| {
+                    Ok(UserRow {
+                        chat_id: r.get(0)?,
+                        username: r.get(1)?,
+                        full_name: r.get(2)?,
+                        banned: r.get::<_, i64>(3)? != 0,
+                    })
+                },
+            )
+            .optional()
+    }
+
+    pub fn is_banned(&self, chat_id: i64) -> rusqlite::Result<bool> {
+        Ok(self
+            .conn
+            .lock()
+            .expect("db mutex poisoned")
+            .query_row(
+                "SELECT banned FROM users WHERE chat_id = ?1",
+                [chat_id],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?
+            .is_some_and(|v| v != 0))
+    }
+
+    pub fn set_banned(&self, chat_id: i64, banned: bool) -> rusqlite::Result<bool> {
+        let changed = self.conn.lock().expect("db mutex poisoned").execute(
+            "UPDATE users SET banned = ?2 WHERE chat_id = ?1",
+            params![chat_id, banned as i64],
+        )?;
+        Ok(changed == 1)
+    }
+
     pub fn all_users(&self) -> rusqlite::Result<Vec<UserRow>> {
         let conn = self.conn.lock().expect("db mutex poisoned");
-        let mut stmt = conn.prepare("SELECT chat_id, username, full_name FROM users")?;
+        let mut stmt = conn.prepare("SELECT chat_id, username, full_name, banned FROM users")?;
         let rows = stmt.query_map([], |r| {
             Ok(UserRow {
                 chat_id: r.get(0)?,
                 username: r.get(1)?,
                 full_name: r.get(2)?,
+                banned: r.get::<_, i64>(3)? != 0,
             })
         })?;
         rows.collect()
+    }
+
+    pub fn complete_past_bookings(&self) -> rusqlite::Result<usize> {
+        let changed = self.conn.lock().expect("db mutex poisoned").execute(
+            "UPDATE bookings SET status = 'completed'
+             WHERE id IN (
+                 SELECT b.id FROM bookings b JOIN slots s ON s.id = b.slot_id
+                 WHERE b.status IN ('booked', 'confirmed')
+                   AND datetime(s.starts_at, '+' || s.duration_min || ' minutes') <= ?1
+             )",
+            params![to_sql(Utc::now())],
+        )?;
+        Ok(changed)
     }
 
     pub fn insert_slot(
@@ -148,6 +224,70 @@ impl Database {
             params![to_sql(starts_at), duration_min],
         )?;
         Ok(changed == 1)
+    }
+
+    pub fn insert_slots_batch(&self, slots: &[(DateTime<Utc>, i64)]) -> rusqlite::Result<usize> {
+        let mut conn = self.conn.lock().expect("db mutex poisoned");
+        let tx = conn.transaction()?;
+        let mut created = 0usize;
+        for (starts_at, duration_min) in slots {
+            let n = tx.execute(
+                "INSERT OR IGNORE INTO slots (starts_at, duration_min) VALUES (?1, ?2)",
+                params![to_sql(*starts_at), duration_min],
+            )?;
+            created += n;
+        }
+        tx.commit()?;
+        Ok(created)
+    }
+
+    pub fn get_workday(&self) -> rusqlite::Result<Option<(i64, i64, i64)>> {
+        self.conn
+            .lock()
+            .expect("db mutex poisoned")
+            .query_row(
+                "SELECT from_min, to_min, step_min FROM workday WHERE id = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()
+    }
+
+    pub fn set_workday(&self, from_min: i64, to_min: i64, step_min: i64) -> rusqlite::Result<()> {
+        self.conn.lock().expect("db mutex poisoned").execute(
+            "INSERT INTO workday (id, from_min, to_min, step_min) VALUES (1, ?1, ?2, ?3)
+                 ON CONFLICT(id) DO UPDATE SET from_min = ?1, to_min = ?2, step_min = ?3",
+            params![from_min, to_min, step_min],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_free_slots_range(
+        &self,
+        lo: DateTime<Utc>,
+        hi: DateTime<Utc>,
+    ) -> rusqlite::Result<(usize, usize)> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let booked: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM slots s
+             WHERE s.starts_at >= ?1 AND s.starts_at < ?2 AND s.starts_at > ?3
+               AND EXISTS (
+                   SELECT 1 FROM bookings b
+                   WHERE b.slot_id = s.id AND b.status IN ('booked', 'confirmed')
+               )",
+            params![to_sql(lo), to_sql(hi), to_sql(Utc::now())],
+            |r| r.get(0),
+        )?;
+        let deleted = conn.execute(
+            "DELETE FROM slots
+             WHERE starts_at >= ?1 AND starts_at < ?2 AND starts_at > ?3
+               AND NOT EXISTS (
+                   SELECT 1 FROM bookings b
+                   WHERE b.slot_id = slots.id AND b.status IN ('booked', 'confirmed')
+               )",
+            params![to_sql(lo), to_sql(hi), to_sql(Utc::now())],
+        )?;
+        Ok((deleted, booked as usize))
     }
 
     pub fn delete_slot(&self, slot_id: i64) -> rusqlite::Result<DeleteSlotResult> {
@@ -248,7 +388,7 @@ impl Database {
         let conn = self.conn.lock().expect("db mutex poisoned");
         let mut stmt = conn.prepare(
             "SELECT b.id, b.slot_id, b.user_chat_id, s.starts_at, s.duration_min, b.status,
-                    u.chat_id, u.username, u.full_name
+                    u.chat_id, u.username, u.full_name, u.banned
              FROM bookings b
              JOIN slots s ON s.id = b.slot_id
              JOIN users u ON u.chat_id = b.user_chat_id
@@ -268,6 +408,7 @@ impl Database {
                     chat_id: r.get(6)?,
                     username: r.get(7)?,
                     full_name: r.get(8)?,
+                    banned: r.get::<_, i64>(9)? != 0,
                 },
             ))
         })?;
